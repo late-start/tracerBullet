@@ -2581,13 +2581,14 @@ dateExtent[0] = new Date(dateExtent[0] - pad);
 dateExtent[1] = new Date(+dateExtent[1] + pad);
 
 // ── Layout constants ──
-const MARGIN = { top: 60, right: 30, bottom: 40, left: 180 };
+const MARGIN = { top: 60, right: 140, bottom: 40, left: 180 };
 const ROW_H = 28;
-const ERA_H = 36;
-const GAP = 8;
+const ERA_H = 44;
+const GAP = 6;
 const fileCount = DATA.files.length;
 const eraCount = DATA.eras.length;
-const totalH = MARGIN.top + (eraCount > 0 ? ERA_H + GAP : 0) + fileCount * (ROW_H + GAP) + DATA.deadCode.length * (ROW_H * 0.7 + GAP) + MARGIN.bottom + 80;
+const DEAD_ROW_H_CALC = 24;
+const totalH = MARGIN.top + (eraCount > 0 ? eraCount * (ERA_H + 4) + GAP * 2 : 0) + 20 + fileCount * (ROW_H + GAP) + 20 + (DATA.deadCode.length > 0 ? 20 + DATA.deadCode.length * (DEAD_ROW_H_CALC + 2) : 0) + MARGIN.bottom + 60;
 const W = document.getElementById('timeline').clientWidth - 20;
 
 // ── SVG ──
@@ -2599,7 +2600,11 @@ const x = d3.scaleTime().domain(dateExtent).range([MARGIN.left, W - MARGIN.right
 
 // ── Time axis ──
 const axisG = svg.append('g').attr('transform', 'translate(0,' + MARGIN.top + ')');
-const axis = d3.axisTop(x).ticks(d3.timeMonth.every(2)).tickFormat(d3.timeFormat('%b %Y')).tickSize(-totalH + MARGIN.top + MARGIN.bottom);
+// Auto-pick tick interval based on time range
+const rangeDays = (dateExtent[1] - dateExtent[0]) / (24 * 60 * 60 * 1000);
+const tickInterval = rangeDays > 365 ? d3.timeMonth.every(3) : rangeDays > 90 ? d3.timeMonth.every(1) : d3.timeWeek.every(1);
+const tickFmt = rangeDays > 90 ? d3.timeFormat('%b %Y') : d3.timeFormat('%b %d');
+const axis = d3.axisTop(x).ticks(tickInterval).tickFormat(tickFmt).tickSize(-totalH + MARGIN.top + MARGIN.bottom);
 axisG.call(axis)
   .selectAll('line').attr('stroke', '#222').attr('stroke-dasharray', '2,4');
 axisG.selectAll('text').attr('fill', '#555').attr('font-size', 10);
@@ -2611,19 +2616,29 @@ let yOffset = MARGIN.top + 16;
 if (eraCount > 0) {
   const eraG = svg.append('g').attr('class', 'eras');
   const eraColors = ['#1e3a5f', '#3b2f2f', '#2f3b2f', '#3b2f3b', '#2f3b3b'];
+  // Stack eras vertically to avoid overlap
   DATA.eras.forEach((era, i) => {
-    const x0 = x(parseDate(era.startDate));
-    const x1 = x(parseDate(era.endDate));
-    const w = Math.max(x1 - x0, 40);
+    const x0 = Math.max(x(parseDate(era.startDate)), MARGIN.left);
+    const x1 = Math.min(x(parseDate(era.endDate)), W - MARGIN.right);
+    const w = Math.max(x1 - x0, 80);
+    const eraY = yOffset + i * (ERA_H + 4);
     const g = eraG.append('g').attr('class', 'era').on('click', () => showEraDetail(era));
-    g.append('rect').attr('x', x0).attr('y', yOffset).attr('width', w).attr('height', ERA_H)
-      .attr('fill', eraColors[i % eraColors.length]).attr('opacity', 0.7);
-    g.append('text').attr('class', 'era-label').attr('x', x0 + 8).attr('y', yOffset + 14)
-      .text(era.label.length > 40 ? era.label.slice(0, 38) + '...' : era.label);
-    g.append('text').attr('class', 'era-date').attr('x', x0 + 8).attr('y', yOffset + 28)
+
+    // Clip group so text doesn't overflow
+    const clipId = 'era-clip-' + i;
+    svg.append('defs').append('clipPath').attr('id', clipId)
+      .append('rect').attr('x', x0).attr('y', eraY).attr('width', w).attr('height', ERA_H);
+
+    g.append('rect').attr('x', x0).attr('y', eraY).attr('width', w).attr('height', ERA_H)
+      .attr('fill', eraColors[i % eraColors.length]).attr('opacity', 0.6).attr('rx', 6);
+    g.append('text').attr('class', 'era-label').attr('x', x0 + 10).attr('y', eraY + 17)
+      .attr('clip-path', 'url(#' + clipId + ')')
+      .text(era.label.length > 50 ? era.label.slice(0, 48) + '...' : era.label);
+    g.append('text').attr('class', 'era-date').attr('x', x0 + 10).attr('y', eraY + 32)
+      .attr('clip-path', 'url(#' + clipId + ')')
       .text(era.commitCount + ' commits · ' + era.filesChanged.length + ' files');
   });
-  yOffset += ERA_H + GAP * 2;
+  yOffset += eraCount * (ERA_H + 4) + GAP * 2;
 }
 
 // Section label
@@ -2638,30 +2653,32 @@ const STATUS_COLORS = { active: '#22c55e', supporting: '#6b7280', suspicious: '#
 DATA.files.forEach((f, i) => {
   const created = f.created?.date ? parseDate(f.created.date) : dateExtent[0];
   const modified = f.lastModified?.date ? parseDate(f.lastModified.date) : dateExtent[1];
-  const x0 = x(created);
-  const x1 = x(modified);
-  const w = Math.max(x1 - x0, 6);
+  const x0 = Math.max(x(created), MARGIN.left);
+  const x1 = Math.min(x(modified), W - MARGIN.right);
+  const w = Math.max(x1 - x0, 8);
   const color = STATUS_COLORS[f.status] || '#6b7280';
   const y = yOffset + i * (ROW_H + GAP);
 
   const g = svg.append('g').attr('class', 'file-row').on('click', () => showFileDetail(f));
 
+  // Language indicator (colored left border)
+  const langColor = f.language === 'swift' ? '#f97316' : '#3b82f6';
+  g.append('rect').attr('x', MARGIN.left - 3).attr('y', y + 4).attr('width', 2).attr('height', ROW_H - 8)
+    .attr('fill', langColor).attr('opacity', 0.6).attr('rx', 1);
+
   // Label (left of bar)
-  g.append('text').attr('class', 'file-label').attr('x', MARGIN.left - 8).attr('y', y + ROW_H / 2)
+  g.append('text').attr('class', 'file-label').attr('x', MARGIN.left - 10).attr('y', y + ROW_H / 2)
     .attr('text-anchor', 'end').text(f.label);
 
   // Bar
-  g.append('rect').attr('class', 'file-bar').attr('x', x0).attr('y', y).attr('width', w).attr('height', ROW_H)
-    .attr('fill', color).attr('opacity', 0.6);
+  g.append('rect').attr('class', 'file-bar').attr('x', x0).attr('y', y + 2).attr('width', w).attr('height', ROW_H - 4)
+    .attr('fill', color).attr('opacity', 0.5).attr('rx', 3);
 
-  // Commit count + LOC
-  g.append('text').attr('class', 'file-meta').attr('x', x1 + 6).attr('y', y + ROW_H / 2)
-    .text(f.commitCount + ' commits · ' + f.loc + ' lines');
-
-  // Language badge
-  const langColor = f.language === 'swift' ? '#f97316' : '#3b82f6';
-  g.append('circle').attr('cx', MARGIN.left - 12 - f.label.length * 5.5).attr('cy', y + ROW_H / 2)
-    .attr('r', 3).attr('fill', langColor).attr('opacity', 0.5);
+  // Commit count + LOC (right-aligned to avoid clipping)
+  const metaText = f.commitCount + ' commits · ' + f.loc + ' lines';
+  const metaX = Math.min(x1 + 8, W - MARGIN.right + 8);
+  g.append('text').attr('class', 'file-meta').attr('x', metaX).attr('y', y + ROW_H / 2)
+    .text(metaText);
 });
 
 yOffset += fileCount * (ROW_H + GAP) + 16;
@@ -2672,8 +2689,9 @@ if (DATA.deadCode.length > 0) {
     .attr('font-size', 10).attr('font-weight', 600).text('DEAD / OVER-EXPORTED CODE');
   yOffset += 16;
 
+  const DEAD_ROW_H = 24;
   DATA.deadCode.forEach((d, i) => {
-    const y = yOffset + i * (ROW_H * 0.7 + GAP);
+    const y = yOffset + i * (DEAD_ROW_H + 2);
     const color = d.type === 'dead' ? '#ef4444' : '#f59e0b';
 
     const introduced = d.introduced?.date ? parseDate(d.introduced.date) : null;
@@ -2681,36 +2699,47 @@ if (DATA.deadCode.length > 0) {
 
     const g = svg.append('g').attr('class', 'dead-marker').on('click', () => showDeadDetail(d));
 
-    // Label
-    g.append('text').attr('class', 'file-label').attr('x', MARGIN.left - 8).attr('y', y + 8)
+    // Left label: function name
+    g.append('text').attr('class', 'file-label').attr('x', MARGIN.left - 10).attr('y', y + DEAD_ROW_H / 2)
       .attr('text-anchor', 'end').attr('fill', color).attr('opacity', 0.8)
-      .attr('font-size', 10).text(d.name);
+      .attr('font-size', 10).attr('dominant-baseline', 'middle').text(d.name);
 
-    // Timeline markers
+    // Type indicator (colored left border, matching file rows)
+    g.append('rect').attr('x', MARGIN.left - 3).attr('y', y + 4).attr('width', 2).attr('height', DEAD_ROW_H - 8)
+      .attr('fill', color).attr('opacity', 0.5).attr('rx', 1);
+
+    // Timeline: dashed line spanning the entire row at the midline
+    g.append('line').attr('x1', MARGIN.left).attr('y1', y + DEAD_ROW_H / 2)
+      .attr('x2', W - MARGIN.right).attr('y2', y + DEAD_ROW_H / 2)
+      .attr('stroke', '#222').attr('stroke-width', 0.5).attr('stroke-dasharray', '2,6');
+
+    // Introduced marker
     if (introduced) {
-      const cx = x(introduced);
-      g.append('circle').attr('cx', cx).attr('cy', y + 8).attr('r', 4).attr('fill', color).attr('opacity', 0.7);
-      g.append('text').attr('x', cx + 8).attr('y', y + 11).attr('fill', '#888').attr('font-size', 9)
-        .text('introduced');
-    }
-    if (lastSeen && introduced && lastSeen !== introduced) {
-      const cx2 = x(lastSeen);
-      const cx1 = introduced ? x(introduced) : cx2 - 20;
-      // Line connecting introduced → last seen
-      g.append('line').attr('x1', cx1 + 4).attr('y1', y + 8).attr('x2', cx2 - 4).attr('y2', y + 8)
-        .attr('stroke', color).attr('opacity', 0.3).attr('stroke-width', 1.5).attr('stroke-dasharray', '3,3');
-      g.append('circle').attr('cx', cx2).attr('cy', y + 8).attr('r', 4).attr('fill', color).attr('opacity', 0.4);
-      g.append('text').attr('x', cx2 + 8).attr('y', y + 11).attr('fill', '#666').attr('font-size', 9)
-        .text('last changed');
+      const cx = Math.max(x(introduced), MARGIN.left);
+      g.append('circle').attr('cx', cx).attr('cy', y + DEAD_ROW_H / 2).attr('r', 4)
+        .attr('fill', color).attr('opacity', 0.7);
     }
 
-    // File label
-    g.append('text').attr('x', W - MARGIN.right).attr('y', y + 11)
-      .attr('text-anchor', 'end').attr('fill', '#555').attr('font-size', 9)
+    // Last seen marker + connecting line
+    if (lastSeen && introduced) {
+      const cx1 = Math.max(x(introduced), MARGIN.left);
+      const cx2 = Math.min(x(lastSeen), W - MARGIN.right);
+      if (cx2 > cx1 + 10) {
+        g.append('line').attr('x1', cx1 + 5).attr('y1', y + DEAD_ROW_H / 2)
+          .attr('x2', cx2 - 5).attr('y2', y + DEAD_ROW_H / 2)
+          .attr('stroke', color).attr('opacity', 0.35).attr('stroke-width', 2).attr('stroke-dasharray', '4,4');
+        g.append('circle').attr('cx', cx2).attr('cy', y + DEAD_ROW_H / 2).attr('r', 3)
+          .attr('fill', color).attr('opacity', 0.4);
+      }
+    }
+
+    // Right label: which file (positioned inside right margin)
+    g.append('text').attr('x', W - MARGIN.right + 8).attr('y', y + DEAD_ROW_H / 2)
+      .attr('fill', '#555').attr('font-size', 9).attr('dominant-baseline', 'middle')
       .text(d.fileLabel);
   });
 
-  yOffset += DATA.deadCode.length * (ROW_H * 0.7 + GAP) + 16;
+  yOffset += DATA.deadCode.length * (DEAD_ROW_H + 2) + 16;
 }
 
 // ── Dependency graph section (below timeline) ──

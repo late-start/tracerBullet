@@ -60,7 +60,7 @@ test.describe('Trace HTML Timeline', () => {
     await page.waitForTimeout(500);
 
     const axisTexts = await page.locator('#timeline svg text').allTextContents();
-    const dateTexts = axisTexts.filter(t => t.match(/[A-Z][a-z]{2}\s+\d{4}/)); // e.g. "Feb 2026"
+    const dateTexts = axisTexts.filter(t => t.match(/[A-Z][a-z]{2}\s+\d{2,4}/)); // e.g. "Feb 2026" or "Feb 01"
 
     expect(dateTexts.length).toBeGreaterThan(0);
     for (const t of dateTexts) {

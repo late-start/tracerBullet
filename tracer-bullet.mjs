@@ -2201,7 +2201,22 @@ function traceFeature(description, tsData, swiftData) {
         return `${fromLabel} → ${toLabel}`;
       }),
     },
-    instructions: `The user provided this description of how they believe a feature works:\n\n"${description}"\n\nThe files below were identified as relevant by static analysis. Trace the actual code paths step by step. For each step, cite the file and line/function. Compare the actual behavior to the user's description. Flag:\n- Steps the user described that don't exist in the code\n- Steps in the code the user didn't mention\n- Steps that work differently than described\n- Wrong ordering or assumptions\n- Dead code, stale paths, or cleanup opportunities`,
+    instructions: `The user provided this description of how they believe a feature works:
+
+"${description}"
+
+The files below were identified as relevant by static analysis. Do the following:
+
+1. TRACE — Walk the actual code paths step by step. For each step, cite the file and line/function.
+
+2. COMPARE — Flag discrepancies between the user's description and the code:
+   - Steps the user described that don't exist in the code
+   - Steps in the code the user didn't mention
+   - Steps that work differently than described
+   - Wrong ordering or assumptions
+   - Dead code, stale paths, or cleanup opportunities
+
+3. CORRECTED SPEC — End with a section titled "Corrected spec" containing a concise, accurate paragraph (3-6 sentences) describing what the feature ACTUALLY does, based on the code. This should be documentation-ready — the user should be able to paste it directly into their project docs. Write it in present tense, name the specific technologies/models/services involved, and include the key architectural decisions (caching, fallbacks, concurrency model, etc.) that a new team member would need to know.`,
   };
 }
 

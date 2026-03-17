@@ -257,8 +257,18 @@ function parseTSFile(filePath) {
     addImportedNames(importPath, names);
   }
 
-  // Dynamic imports: import('./path')
-  const dynamicRe = /import\(\s*['"]([^'"]+)['"]\s*\)/g;
+  // Dynamic imports: import('./path') and import('./path').then(({ name }) => ...)
+  // Pattern 1: import('./path').then(({ x, y }) => ...) — destructured names
+  const dynamicThenRe = /import\(\s*['"]([^'"]+)['"]\s*\)\s*\.then\(\s*\(\s*\{([^}]*)\}\s*\)/g;
+  while ((m = dynamicThenRe.exec(content))) {
+    const importPath = m[1];
+    if (!importPath.startsWith('.') && !importPath.startsWith('@/')) continue;
+    imports.push(importPath);
+    const names = extractNames(m[2]);
+    addImportedNames(importPath, names.length > 0 ? names : ['default']);
+  }
+  // Pattern 2: bare import('./path') without .then — lazy/code-split
+  const dynamicRe = /import\(\s*['"]([^'"]+)['"]\s*\)(?!\s*\.then)/g;
   while ((m = dynamicRe.exec(content))) {
     const importPath = m[1];
     if (!importPath.startsWith('.') && !importPath.startsWith('@/')) continue;

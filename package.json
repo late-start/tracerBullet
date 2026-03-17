@@ -1,0 +1,17 @@
+{
+  "name": "tracer-bullet",
+  "version": "0.1.0",
+  "description": "Codebase health map — visualize active code paths, dead exports, and feature traces for TypeScript + Swift projects",
+  "type": "module",
+  "bin": {
+    "tracer-bullet": "./tracer-bullet.mjs"
+  },
+  "scripts": {
+    "visualize": "node tracer-bullet.mjs",
+    "search": "node tracer-bullet.mjs --search",
+    "trace": "node tracer-bullet.mjs --trace",
+    "json": "node tracer-bullet.mjs --json"
+  },
+  "keywords": ["static-analysis", "dead-code", "visualization", "mcp", "codebase-health"],
+  "license": "MIT"
+}

@@ -2257,6 +2257,553 @@ The files below were identified as relevant by static analysis. Do the following
   };
 }
 
+// ───────────────────────────────────────────────
+// Git archaeology: file history + dead code dating
+// ───────────────────────────────────────────────
+
+function getFileHistory(filePath) {
+  try {
+    const log = execSync(
+      `git log --follow --format="%H|%ai|%s" --diff-filter=AMRD -- "${filePath}"`,
+      { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+    ).trim();
+    if (!log) return [];
+    return log.split('\n').map(line => {
+      const [hash, date, ...msgParts] = line.split('|');
+      return { hash, date: date?.trim(), message: msgParts.join('|').trim() };
+    }).filter(c => c.hash && c.date);
+  } catch { return []; }
+}
+
+function getDeadCodeDates(functionName) {
+  // git log -S finds commits where this string was added or removed
+  try {
+    const log = execSync(
+      `git log -S "${functionName.replace(/"/g, '\\"')}" --format="%H|%ai|%s" -- "src/" "ios/"`,
+      { encoding: 'utf-8', timeout: 10000, maxBuffer: 5 * 1024 * 1024 }
+    ).trim();
+    if (!log) return { introduced: null, lastSeen: null };
+    const commits = log.split('\n').map(line => {
+      const [hash, date, ...msgParts] = line.split('|');
+      return { hash, date: date?.trim(), message: msgParts.join('|').trim() };
+    }).filter(c => c.hash && c.date);
+    return {
+      introduced: commits.length > 0 ? commits[commits.length - 1] : null, // oldest
+      lastSeen: commits.length > 1 ? commits[0] : null, // most recent change
+    };
+  } catch { return { introduced: null, lastSeen: null }; }
+}
+
+function detectEras(fileHistories) {
+  // Collect all commits that touch traced files, find cluster commits (era boundaries)
+  const allCommits = new Map(); // hash → { date, message, files: [] }
+  for (const [filePath, history] of Object.entries(fileHistories)) {
+    for (const commit of history) {
+      if (!allCommits.has(commit.hash)) {
+        allCommits.set(commit.hash, { ...commit, files: [] });
+      }
+      allCommits.get(commit.hash).files.push(filePath);
+    }
+  }
+
+  // Sort by date descending (newest first)
+  const sorted = [...allCommits.values()].sort((a, b) => new Date(b.date) - new Date(a.date));
+
+  // Era boundaries: commits touching 3+ traced files, or first/last commit
+  const boundaries = sorted.filter(c => c.files.length >= 3);
+
+  // If no multi-file commits, use time-based clustering (>30 day gaps)
+  if (boundaries.length === 0 && sorted.length > 1) {
+    let prevDate = new Date(sorted[0].date);
+    for (let i = 1; i < sorted.length; i++) {
+      const d = new Date(sorted[i].date);
+      if (prevDate - d > 30 * 24 * 60 * 60 * 1000) {
+        boundaries.push(sorted[i]);
+      }
+      prevDate = d;
+    }
+  }
+
+  // Build eras from boundaries
+  const eras = [];
+  const allSorted = sorted;
+  if (allSorted.length === 0) return eras;
+
+  // Add the first commit as a boundary if not already
+  const firstCommit = allSorted[allSorted.length - 1];
+  const lastCommit = allSorted[0];
+
+  // Group all commits into eras (between boundary commits)
+  const boundaryDates = [
+    new Date(lastCommit.date).getTime() + 1, // end sentinel
+    ...boundaries.map(b => new Date(b.date).getTime()),
+    new Date(firstCommit.date).getTime() - 1, // start sentinel
+  ].sort((a, b) => b - a); // descending
+
+  for (let i = 0; i < boundaryDates.length - 1; i++) {
+    const eraCommits = allSorted.filter(c => {
+      const t = new Date(c.date).getTime();
+      return t <= boundaryDates[i] && t >= boundaryDates[i + 1];
+    });
+    if (eraCommits.length === 0) continue;
+
+    // Era label: use the biggest commit's message, or the boundary commit
+    const biggest = eraCommits.reduce((a, b) => (b.files.length > a.files.length ? b : a), eraCommits[0]);
+    const filesChanged = new Set(eraCommits.flatMap(c => c.files));
+    eras.push({
+      startDate: eraCommits[eraCommits.length - 1].date,
+      endDate: eraCommits[0].date,
+      label: biggest.message.slice(0, 80),
+      commitCount: eraCommits.length,
+      filesChanged: [...filesChanged],
+    });
+  }
+
+  return eras;
+}
+
+function buildTraceTimeline(traceResult) {
+  console.error('   Building git timeline...');
+  const primaryFiles = traceResult.files.filter(f => f.role === 'primary');
+
+  // Get file histories
+  const fileHistories = {};
+  for (const f of primaryFiles) {
+    const fullPath = path.join(ROOT, f.path);
+    fileHistories[f.path] = getFileHistory(f.path);
+    console.error(`     ${f.label}: ${fileHistories[f.path].length} commits`);
+  }
+
+  // Detect eras
+  const eras = detectEras(fileHistories);
+  console.error(`   ${eras.length} eras detected`);
+
+  // Date dead/over-exported code
+  const deadCodeDates = [];
+  for (const f of primaryFiles) {
+    const deadExports = f.exportAnalysis?.dead || [];
+    const overExported = f.exportAnalysis?.internalOnly || [];
+    // Only date the first few to keep git queries fast
+    for (const name of deadExports.slice(0, 5)) {
+      const dates = getDeadCodeDates(name);
+      deadCodeDates.push({ name, file: f.path, fileLabel: f.label, type: 'dead', ...dates });
+    }
+    for (const name of overExported.slice(0, 3)) {
+      const dates = getDeadCodeDates(name);
+      deadCodeDates.push({ name, file: f.path, fileLabel: f.label, type: 'over-exported', ...dates });
+    }
+  }
+  console.error(`   ${deadCodeDates.length} dead/over-exported items dated`);
+
+  // Build file timeline entries
+  const fileTimelines = primaryFiles.map(f => {
+    const history = fileHistories[f.path] || [];
+    return {
+      path: f.path,
+      label: f.label,
+      language: f.language,
+      status: f.status,
+      loc: f.loc,
+      created: history.length > 0 ? history[history.length - 1] : null,
+      lastModified: history.length > 0 ? history[0] : null,
+      commitCount: history.length,
+      cluster: f.cluster,
+    };
+  });
+
+  return {
+    description: traceResult.description,
+    searchTerms: traceResult.searchTerms,
+    fileCount: primaryFiles.length,
+    neighborCount: traceResult.neighborCount,
+    entryPoints: traceResult.entryPoints,
+    dependencyGraph: traceResult.dependencyGraph,
+    instructions: traceResult.instructions,
+    eras,
+    files: fileTimelines,
+    deadCode: deadCodeDates,
+    // Date range
+    firstCommit: fileTimelines.reduce((min, f) => {
+      if (!f.created?.date) return min;
+      return !min || new Date(f.created.date) < new Date(min) ? f.created.date : min;
+    }, null),
+    lastCommit: fileTimelines.reduce((max, f) => {
+      if (!f.lastModified?.date) return max;
+      return !max || new Date(f.lastModified.date) > new Date(max) ? f.lastModified.date : max;
+    }, null),
+  };
+}
+
+function generateTraceHTML(timeline) {
+  const DATA = JSON.stringify(timeline);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tracer Bullet — ${timeline.description.slice(0, 50)}</title>
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://d3js.org/d3.v7.min.js"><\/script>
+<style>
+:root {
+  --ink: #1a1a1a; --paper: #fafaf9; --accent: #d97706;
+  --green: #22c55e; --amber: #f59e0b; --red: #ef4444;
+  --blue: #3b82f6; --gray: #6b7280;
+  --bg: #111; --surface: #1e1e1e; --border: #333;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--paper); font-family:'Inter',system-ui,sans-serif; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+
+header { padding:16px 24px; border-bottom:1px solid var(--border); }
+.title-row { display:flex; align-items:baseline; gap:12px; margin-bottom:8px; }
+.title-row h1 { font-family:'Crimson Pro',serif; font-size:20px; font-weight:700; }
+.title-row .sub { font-size:12px; color:var(--gray); }
+.stats { display:flex; gap:20px; font-size:12px; color:var(--gray); }
+.stats .stat { display:flex; align-items:center; gap:5px; }
+.stats .dot { width:7px; height:7px; border-radius:50%; }
+
+main { flex:1; display:grid; grid-template-columns:1fr 360px; overflow:hidden; }
+
+/* Timeline area */
+.timeline-area { overflow:auto; padding:24px; }
+.timeline-area svg { width:100%; }
+
+/* Era blocks */
+.era { cursor:pointer; }
+.era rect { rx:6; transition: opacity 0.2s; }
+.era:hover rect { opacity:0.9; }
+.era-label { font-family:'Inter',system-ui,sans-serif; font-size:11px; font-weight:600; fill:var(--paper); pointer-events:none; }
+.era-date { font-family:'Inter',system-ui,sans-serif; font-size:10px; fill:var(--gray); pointer-events:none; }
+
+/* File rows */
+.file-row { cursor:pointer; }
+.file-row:hover .file-bar { filter:brightness(1.3); }
+.file-bar { rx:3; transition:filter 0.15s; }
+.file-label { font-family:'Inter',system-ui,sans-serif; font-size:11px; fill:var(--paper); dominant-baseline:middle; }
+.file-meta { font-family:'Inter',system-ui,sans-serif; font-size:10px; fill:var(--gray); dominant-baseline:middle; }
+
+/* Dead code markers */
+.dead-marker { cursor:pointer; }
+.dead-marker circle { transition:r 0.15s; }
+.dead-marker:hover circle { r:6; }
+.dead-label { font-family:'Inter',system-ui,sans-serif; font-size:9px; fill:var(--red); pointer-events:none; }
+
+/* Dependency graph */
+.dep-section { margin-top:20px; padding:16px; background:var(--surface); border-radius:8px; border:1px solid var(--border); }
+.dep-edge { font-size:12px; color:#999; padding:2px 0; }
+.dep-edge .arrow { color:var(--accent); }
+
+/* Detail panel */
+.panel { border-left:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
+.panel-header { padding:14px 18px; border-bottom:1px solid var(--border); font-family:'Crimson Pro',serif; font-size:17px; font-weight:600; }
+.panel-body { flex:1; overflow-y:auto; padding:14px 18px; }
+.panel-section { margin-bottom:16px; }
+.panel-section h3 { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:var(--gray); margin-bottom:6px; }
+.panel-section p { font-size:12px; line-height:1.5; color:#d1d5db; }
+.panel-section ul { list-style:none; padding:0; }
+.panel-section li { font-size:12px; padding:3px 0; color:#d1d5db; display:flex; align-items:center; gap:5px; }
+.panel-section li .pip { width:5px; height:5px; border-radius:50%; flex-shrink:0; }
+
+.badge { display:inline-block; font-size:10px; font-weight:600; padding:2px 7px; border-radius:10px; text-transform:uppercase; letter-spacing:0.03em; }
+.badge-dead { background:rgba(239,68,68,0.15); color:var(--red); }
+.badge-over { background:rgba(245,158,11,0.15); color:var(--amber); }
+.badge-active { background:rgba(34,197,94,0.15); color:var(--green); }
+.badge-supporting { background:rgba(107,114,128,0.15); color:var(--gray); }
+
+.commit-item { padding:6px 8px; border-radius:5px; margin-bottom:4px; font-size:11px; background:rgba(255,255,255,0.03); }
+.commit-item .hash { color:var(--accent); font-family:monospace; font-size:10px; }
+.commit-item .date { color:var(--gray); font-size:10px; }
+.commit-item .msg { color:#ccc; margin-top:2px; }
+
+.legend { display:flex; gap:16px; margin-top:12px; font-size:11px; color:var(--gray); flex-wrap:wrap; }
+.legend-item { display:flex; align-items:center; gap:5px; }
+.legend-swatch { width:12px; height:8px; border-radius:2px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title-row">
+    <h1>Tracer Bullet</h1>
+    <span class="sub" id="description"></span>
+  </div>
+  <div class="stats" id="stats"></div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--green)"></div> Active (changed recently)</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--gray)"></div> Supporting (stable)</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--red)"></div> Dead code (no callers)</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:var(--amber)"></div> Over-exported (internal only)</div>
+  </div>
+</header>
+
+<main>
+  <div class="timeline-area" id="timeline"></div>
+  <div class="panel">
+    <div class="panel-header" id="panel-title">Overview</div>
+    <div class="panel-body" id="panel-body">
+      <div class="panel-section"><p style="color:var(--gray)">Click a file or dead code marker for details.</p></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const DATA = ${DATA};
+
+// ── Render header ──
+document.getElementById('description').textContent = DATA.description;
+document.getElementById('stats').innerHTML =
+  '<div class="stat"><div class="dot" style="background:var(--blue)"></div>' + DATA.fileCount + ' files</div>' +
+  '<div class="stat"><div class="dot" style="background:var(--gray)"></div>' + DATA.neighborCount + ' neighbors</div>' +
+  '<div class="stat"><div class="dot" style="background:var(--accent)"></div>' + DATA.eras.length + ' eras</div>' +
+  '<div class="stat"><div class="dot" style="background:var(--red)"></div>' + DATA.deadCode.length + ' dead items</div>';
+
+// ── Time scale ──
+const parseDate = d3.timeParse('%Y-%m-%d %H:%M:%S %Z');
+const allDates = [];
+DATA.files.forEach(f => {
+  if (f.created?.date) allDates.push(parseDate(f.created.date));
+  if (f.lastModified?.date) allDates.push(parseDate(f.lastModified.date));
+});
+DATA.deadCode.forEach(d => {
+  if (d.introduced?.date) allDates.push(parseDate(d.introduced.date));
+  if (d.lastSeen?.date) allDates.push(parseDate(d.lastSeen.date));
+});
+DATA.eras.forEach(e => {
+  allDates.push(parseDate(e.startDate));
+  allDates.push(parseDate(e.endDate));
+});
+const validDates = allDates.filter(Boolean);
+if (validDates.length === 0) validDates.push(new Date());
+const dateExtent = d3.extent(validDates);
+// Pad by 5% on each side
+const pad = (dateExtent[1] - dateExtent[0]) * 0.05 || 86400000;
+dateExtent[0] = new Date(dateExtent[0] - pad);
+dateExtent[1] = new Date(+dateExtent[1] + pad);
+
+// ── Layout constants ──
+const MARGIN = { top: 60, right: 30, bottom: 40, left: 180 };
+const ROW_H = 28;
+const ERA_H = 36;
+const GAP = 8;
+const fileCount = DATA.files.length;
+const eraCount = DATA.eras.length;
+const totalH = MARGIN.top + (eraCount > 0 ? ERA_H + GAP : 0) + fileCount * (ROW_H + GAP) + DATA.deadCode.length * (ROW_H * 0.7 + GAP) + MARGIN.bottom + 80;
+const W = document.getElementById('timeline').clientWidth - 20;
+
+// ── SVG ──
+const svg = d3.select('#timeline').append('svg')
+  .attr('width', W)
+  .attr('height', totalH);
+
+const x = d3.scaleTime().domain(dateExtent).range([MARGIN.left, W - MARGIN.right]);
+
+// ── Time axis ──
+const axisG = svg.append('g').attr('transform', 'translate(0,' + MARGIN.top + ')');
+const axis = d3.axisTop(x).ticks(d3.timeMonth.every(2)).tickFormat(d3.timeFormat('%b %Y')).tickSize(-totalH + MARGIN.top + MARGIN.bottom);
+axisG.call(axis)
+  .selectAll('line').attr('stroke', '#222').attr('stroke-dasharray', '2,4');
+axisG.selectAll('text').attr('fill', '#555').attr('font-size', 10);
+axisG.select('.domain').attr('stroke', '#333');
+
+let yOffset = MARGIN.top + 16;
+
+// ── Eras ──
+if (eraCount > 0) {
+  const eraG = svg.append('g').attr('class', 'eras');
+  const eraColors = ['#1e3a5f', '#3b2f2f', '#2f3b2f', '#3b2f3b', '#2f3b3b'];
+  DATA.eras.forEach((era, i) => {
+    const x0 = x(parseDate(era.startDate));
+    const x1 = x(parseDate(era.endDate));
+    const w = Math.max(x1 - x0, 40);
+    const g = eraG.append('g').attr('class', 'era').on('click', () => showEraDetail(era));
+    g.append('rect').attr('x', x0).attr('y', yOffset).attr('width', w).attr('height', ERA_H)
+      .attr('fill', eraColors[i % eraColors.length]).attr('opacity', 0.7);
+    g.append('text').attr('class', 'era-label').attr('x', x0 + 8).attr('y', yOffset + 14)
+      .text(era.label.length > 40 ? era.label.slice(0, 38) + '...' : era.label);
+    g.append('text').attr('class', 'era-date').attr('x', x0 + 8).attr('y', yOffset + 28)
+      .text(era.commitCount + ' commits · ' + era.filesChanged.length + ' files');
+  });
+  yOffset += ERA_H + GAP * 2;
+}
+
+// Section label
+svg.append('text').attr('x', 12).attr('y', yOffset + 4).attr('fill', '#555')
+  .attr('font-size', 10).attr('font-weight', 600).attr('text-transform', 'uppercase')
+  .text('FILES');
+yOffset += 16;
+
+// ── File bars ──
+const STATUS_COLORS = { active: '#22c55e', supporting: '#6b7280', suspicious: '#f59e0b', cruft: '#ef4444', deleted: '#444' };
+
+DATA.files.forEach((f, i) => {
+  const created = f.created?.date ? parseDate(f.created.date) : dateExtent[0];
+  const modified = f.lastModified?.date ? parseDate(f.lastModified.date) : dateExtent[1];
+  const x0 = x(created);
+  const x1 = x(modified);
+  const w = Math.max(x1 - x0, 6);
+  const color = STATUS_COLORS[f.status] || '#6b7280';
+  const y = yOffset + i * (ROW_H + GAP);
+
+  const g = svg.append('g').attr('class', 'file-row').on('click', () => showFileDetail(f));
+
+  // Label (left of bar)
+  g.append('text').attr('class', 'file-label').attr('x', MARGIN.left - 8).attr('y', y + ROW_H / 2)
+    .attr('text-anchor', 'end').text(f.label);
+
+  // Bar
+  g.append('rect').attr('class', 'file-bar').attr('x', x0).attr('y', y).attr('width', w).attr('height', ROW_H)
+    .attr('fill', color).attr('opacity', 0.6);
+
+  // Commit count + LOC
+  g.append('text').attr('class', 'file-meta').attr('x', x1 + 6).attr('y', y + ROW_H / 2)
+    .text(f.commitCount + ' commits · ' + f.loc + ' lines');
+
+  // Language badge
+  const langColor = f.language === 'swift' ? '#f97316' : '#3b82f6';
+  g.append('circle').attr('cx', MARGIN.left - 12 - f.label.length * 5.5).attr('cy', y + ROW_H / 2)
+    .attr('r', 3).attr('fill', langColor).attr('opacity', 0.5);
+});
+
+yOffset += fileCount * (ROW_H + GAP) + 16;
+
+// ── Dead code markers ──
+if (DATA.deadCode.length > 0) {
+  svg.append('text').attr('x', 12).attr('y', yOffset + 4).attr('fill', '#555')
+    .attr('font-size', 10).attr('font-weight', 600).text('DEAD / OVER-EXPORTED CODE');
+  yOffset += 16;
+
+  DATA.deadCode.forEach((d, i) => {
+    const y = yOffset + i * (ROW_H * 0.7 + GAP);
+    const color = d.type === 'dead' ? '#ef4444' : '#f59e0b';
+
+    const introduced = d.introduced?.date ? parseDate(d.introduced.date) : null;
+    const lastSeen = d.lastSeen?.date ? parseDate(d.lastSeen.date) : null;
+
+    const g = svg.append('g').attr('class', 'dead-marker').on('click', () => showDeadDetail(d));
+
+    // Label
+    g.append('text').attr('class', 'file-label').attr('x', MARGIN.left - 8).attr('y', y + 8)
+      .attr('text-anchor', 'end').attr('fill', color).attr('opacity', 0.8)
+      .attr('font-size', 10).text(d.name);
+
+    // Timeline markers
+    if (introduced) {
+      const cx = x(introduced);
+      g.append('circle').attr('cx', cx).attr('cy', y + 8).attr('r', 4).attr('fill', color).attr('opacity', 0.7);
+      g.append('text').attr('x', cx + 8).attr('y', y + 11).attr('fill', '#888').attr('font-size', 9)
+        .text('introduced');
+    }
+    if (lastSeen && introduced && lastSeen !== introduced) {
+      const cx2 = x(lastSeen);
+      const cx1 = introduced ? x(introduced) : cx2 - 20;
+      // Line connecting introduced → last seen
+      g.append('line').attr('x1', cx1 + 4).attr('y1', y + 8).attr('x2', cx2 - 4).attr('y2', y + 8)
+        .attr('stroke', color).attr('opacity', 0.3).attr('stroke-width', 1.5).attr('stroke-dasharray', '3,3');
+      g.append('circle').attr('cx', cx2).attr('cy', y + 8).attr('r', 4).attr('fill', color).attr('opacity', 0.4);
+      g.append('text').attr('x', cx2 + 8).attr('y', y + 11).attr('fill', '#666').attr('font-size', 9)
+        .text('last changed');
+    }
+
+    // File label
+    g.append('text').attr('x', W - MARGIN.right).attr('y', y + 11)
+      .attr('text-anchor', 'end').attr('fill', '#555').attr('font-size', 9)
+      .text(d.fileLabel);
+  });
+
+  yOffset += DATA.deadCode.length * (ROW_H * 0.7 + GAP) + 16;
+}
+
+// ── Dependency graph section (below timeline) ──
+const depDiv = document.createElement('div');
+depDiv.className = 'dep-section';
+depDiv.innerHTML = '<h3 style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--gray);margin-bottom:8px;">Dependency Flow</h3>' +
+  DATA.dependencyGraph.summary
+    .filter((s, i, arr) => arr.indexOf(s) === i) // dedup
+    .slice(0, 30)
+    .map(s => '<div class="dep-edge"><span class="arrow">→</span> ' + s.replace(' → ', ' <span class="arrow">→</span> ') + '</div>')
+    .join('');
+document.getElementById('timeline').appendChild(depDiv);
+
+// ── Panel helpers ──
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function fmtDate(d) { if (!d) return '—'; return new Date(d).toLocaleDateString('en-US', { year:'numeric', month:'short', day:'numeric' }); }
+
+function showFileDetail(f) {
+  document.getElementById('panel-title').textContent = f.label;
+  let h = '';
+  h += '<div class="panel-section"><span class="badge badge-' + f.status + '">' + f.status + '</span>';
+  h += ' <span style="color:var(--gray);font-size:11px">' + f.language + '</span></div>';
+  h += '<div class="panel-section"><h3>Location</h3><p style="font-family:monospace;font-size:10px;color:#888;word-break:break-all">' + esc(f.path) + '</p>';
+  h += '<p style="font-size:11px;color:var(--gray)">' + f.loc + ' lines · ' + f.commitCount + ' commits</p></div>';
+  h += '<div class="panel-section"><h3>Timeline</h3>';
+  h += '<p>Created: ' + fmtDate(f.created?.date) + '</p>';
+  h += '<p>Last modified: ' + fmtDate(f.lastModified?.date) + '</p>';
+  if (f.created?.message) h += '<div class="commit-item"><div class="msg">' + esc(f.created.message) + '</div><div class="date">' + fmtDate(f.created.date) + '</div></div>';
+  if (f.lastModified?.message && f.lastModified.hash !== f.created?.hash) h += '<div class="commit-item"><div class="msg">' + esc(f.lastModified.message) + '</div><div class="date">' + fmtDate(f.lastModified.date) + '</div></div>';
+  h += '</div>';
+
+  // Dead code in this file
+  const fileDead = DATA.deadCode.filter(d => d.file === f.path);
+  if (fileDead.length > 0) {
+    h += '<div class="panel-section"><h3>Dead / Over-exported</h3><ul>';
+    fileDead.forEach(d => {
+      const badge = d.type === 'dead' ? 'badge-dead' : 'badge-over';
+      h += '<li><span class="pip" style="background:' + (d.type==='dead'?'var(--red)':'var(--amber)') + '"></span>';
+      h += esc(d.name) + ' <span class="badge ' + badge + '">' + d.type + '</span>';
+      if (d.introduced?.date) h += '<br><span style="font-size:10px;color:#666">introduced ' + fmtDate(d.introduced.date) + '</span>';
+      h += '</li>';
+    });
+    h += '</ul></div>';
+  }
+
+  document.getElementById('panel-body').innerHTML = h;
+}
+
+function showDeadDetail(d) {
+  document.getElementById('panel-title').textContent = d.name;
+  let h = '';
+  const badge = d.type === 'dead' ? 'badge-dead' : 'badge-over';
+  h += '<div class="panel-section"><span class="badge ' + badge + '">' + d.type + '</span></div>';
+  h += '<div class="panel-section"><h3>Location</h3><p>' + esc(d.fileLabel) + '</p>';
+  h += '<p style="font-family:monospace;font-size:10px;color:#888">' + esc(d.file) + '</p></div>';
+  h += '<div class="panel-section"><h3>Lifecycle</h3>';
+  if (d.introduced) {
+    h += '<div class="commit-item"><div class="date">Introduced: ' + fmtDate(d.introduced.date) + '</div>';
+    h += '<div class="msg">' + esc(d.introduced.message) + '</div>';
+    h += '<div class="hash">' + (d.introduced.hash||'').slice(0,7) + '</div></div>';
+  }
+  if (d.lastSeen && d.lastSeen.hash !== d.introduced?.hash) {
+    h += '<div class="commit-item"><div class="date">Last changed: ' + fmtDate(d.lastSeen.date) + '</div>';
+    h += '<div class="msg">' + esc(d.lastSeen.message) + '</div>';
+    h += '<div class="hash">' + (d.lastSeen.hash||'').slice(0,7) + '</div></div>';
+  }
+  if (d.type === 'dead') {
+    h += '<p style="color:var(--red);font-size:12px;margin-top:8px">This export has no callers — not used externally or internally. Safe to delete.</p>';
+  } else {
+    h += '<p style="color:var(--amber);font-size:12px;margin-top:8px">Used internally but never imported by other files. Remove the export keyword.</p>';
+  }
+  h += '</div>';
+  document.getElementById('panel-body').innerHTML = h;
+}
+
+function showEraDetail(era) {
+  document.getElementById('panel-title').textContent = 'Era: ' + era.label.slice(0, 40);
+  let h = '';
+  h += '<div class="panel-section"><h3>Period</h3>';
+  h += '<p>' + fmtDate(era.startDate) + ' — ' + fmtDate(era.endDate) + '</p>';
+  h += '<p>' + era.commitCount + ' commits · ' + era.filesChanged.length + ' files changed</p></div>';
+  h += '<div class="panel-section"><h3>Files Changed</h3><ul>';
+  era.filesChanged.forEach(f => {
+    const file = DATA.files.find(ff => ff.path === f);
+    h += '<li><span class="pip" style="background:var(--blue)"></span>' + esc(file?.label || f) + '</li>';
+  });
+  h += '</ul></div>';
+  document.getElementById('panel-body').innerHTML = h;
+}
+<\/script>
+</body>
+</html>`;
+}
+
 function copyToClipboard(text) {
   try {
     execSync('pbcopy', { input: text, encoding: 'utf-8' });
@@ -2304,6 +2851,20 @@ function main() {
     console.error(`   Strategy: ${result.searchStrategy}`);
     console.error(`   ${result.matchCount} primary files, ${result.neighborCount} neighbors`);
     console.error(`   Entry points: ${result.entryPoints.join(', ')}`);
+
+    // --html flag: generate interactive timeline visualization
+    const htmlMode = args.includes('--html');
+    if (htmlMode) {
+      const timeline = buildTraceTimeline(result);
+      const html = generateTraceHTML(timeline);
+      const outPath = path.join(ROOT, 'trace.html');
+      fs.writeFileSync(outPath, html);
+      console.error(`✅ Written to ${outPath}`);
+      // Auto-open in browser
+      try { execSync(`open "${outPath}"`); } catch { /* non-macOS */ }
+      return;
+    }
+
     const json = JSON.stringify(result, null, 2);
     if (copyMode) {
       if (copyToClipboard(json)) {

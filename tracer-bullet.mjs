@@ -2557,7 +2557,8 @@ document.getElementById('stats').innerHTML =
   '<div class="stat"><div class="dot" style="background:var(--red)"></div>' + DATA.deadCode.length + ' dead items</div>';
 
 // ── Time scale ──
-const parseDate = d3.timeParse('%Y-%m-%d %H:%M:%S %Z');
+// Git dates are "2026-02-15 03:11:49 -0800" — new Date() handles this natively
+const parseDate = (s) => s ? new Date(s) : null;
 const allDates = [];
 DATA.files.forEach(f => {
   if (f.created?.date) allDates.push(parseDate(f.created.date));

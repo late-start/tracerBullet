@@ -603,6 +603,18 @@ function buildTSGraph(gitChanges) {
     });
   }
 
+  // Enrich search terms with labels of imported files (so imageSelector matches "unsplash", "gemini", etc.)
+  const nodeByRel = new Map(nodes.map(n => [n.rel, n]));
+  for (const e of edges) {
+    const fromRel = path.relative(ROOT, e.from);
+    const toRel = path.relative(ROOT, e.to);
+    const fromNode = nodeByRel.get(fromRel);
+    const toNode = nodeByRel.get(toRel);
+    if (fromNode && toNode) {
+      fromNode.searchTerms += ' ' + toNode.label.toLowerCase();
+    }
+  }
+
   // Also include deleted files from git that no longer exist on disk
   for (const [rel, status] of gitChanges) {
     if (status === 'D' && rel.startsWith('src/') && (rel.endsWith('.ts') || rel.endsWith('.tsx'))) {
@@ -1986,20 +1998,108 @@ function searchFiles(query, tsData, swiftData) {
 // Trace: smart code retrieval for LLM reasoning
 // ───────────────────────────────────────────────
 
-function traceFeature(query, intent, tsData, swiftData) {
-  const terms = query.toLowerCase().split(/\s+/);
+const STOPWORDS = new Set([
+  'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+  'should', 'may', 'might', 'shall', 'can', 'need', 'must',
+  'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them',
+  'my', 'your', 'his', 'its', 'our', 'their',
+  'this', 'that', 'these', 'those',
+  'and', 'but', 'or', 'nor', 'not', 'so', 'yet', 'both', 'either', 'neither',
+  'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'from', 'into', 'through',
+  'about', 'after', 'before', 'between', 'under', 'over', 'up', 'down',
+  'if', 'then', 'else', 'when', 'where', 'how', 'what', 'which', 'who', 'whom',
+  'all', 'each', 'every', 'any', 'some', 'no', 'only', 'very', 'just',
+  'also', 'as', 'like', 'than', 'more', 'most', 'less', 'least',
+  'here', 'there', 'now', 'then', 'still', 'already', 'always', 'never',
+  'work', 'works', 'working', 'supposed', 'should', 'does', 'doing',
+  'code', 'feature', 'service', 'system', 'function', 'actually', 'really',
+  'using', 'used', 'uses', 'use', 'called', 'calls', 'call',
+  'handles', 'handle', 'handling',
+  'get', 'gets', 'set', 'sets', 'make', 'makes',
+  'first', 'second', 'third', 'last', 'next', 'best', 'new', 'old',
+  'one', 'two', 'three', 'four', 'five',
+  'pick', 'picks', 'picked', 'select', 'selects', 'selected', 'selection',
+  'send', 'sends', 'sent', 'receive', 'receives', 'received',
+  'show', 'shows', 'shown', 'display', 'displays', 'render', 'renders',
+  'create', 'creates', 'created', 'build', 'builds', 'built',
+  'run', 'runs', 'running', 'start', 'starts', 'started',
+  'check', 'checks', 'checked', 'find', 'finds', 'found',
+  'load', 'loads', 'loaded', 'save', 'saves', 'saved',
+  'data', 'file', 'files', 'list', 'item', 'items', 'result', 'results',
+  'type', 'types', 'value', 'values', 'name', 'names', 'path', 'paths',
+  'error', 'errors', 'response', 'request', 'return', 'returns',
+  'take', 'takes', 'give', 'gives', 'put', 'puts',
+  'user', 'app', 'page', 'view', 'button', 'screen',
+  'server', 'client', 'api', 'endpoint', 'route',
+  'log', 'logs', 'test', 'tests', 'config', 'settings',
+  'pipeline', 'process', 'step', 'steps', 'flow', 'workflow',
+  'source', 'sources', 'fetch', 'fetches', 'fetched',
+  'store', 'stores', 'stored', 'update', 'updates', 'updated',
+  'add', 'adds', 'remove', 'removes', 'delete', 'deletes',
+  'try', 'tries', 'tried', 'different', 'multiple', 'various', 'variety',
+  'then', 'after', 'before', 'during', 'while',
+  'good', 'bad', 'right', 'wrong',
+]);
 
-  // Find matching files across both views
-  const matchingFiles = [];
-  for (const [lang, data] of [['typescript', tsData], ['swift', swiftData]]) {
-    const allFiles = data.clusters.flatMap(c => c.files);
-    for (const f of allFiles) {
-      const haystack = f.searchTerms || (f.label + ' ' + f.rel).toLowerCase();
-      if (terms.every(t => haystack.includes(t)) && f.status !== 'deleted') {
-        matchingFiles.push({ ...f, language: lang });
-      }
-    }
+function extractSearchTerms(description) {
+  // Pull meaningful terms from natural language.
+  // Keep words 4+ chars that aren't stopwords — shorter words are almost always noise.
+  // Exception: known technical terms (3-char) are kept via a small allowlist.
+  const TECHNICAL_SHORT = new Set(['tts', 'pdf', 'api', 'sse', 'jwt', 'ios', 'css', 'llm', 'map', 'sql']);
+  return description
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => !STOPWORDS.has(w) && (w.length >= 4 || TECHNICAL_SHORT.has(w)))
+    .filter((w, i, arr) => arr.indexOf(w) === i); // deduplicate
+}
+
+function adaptiveSearch(terms, tsData, swiftData) {
+  const allFiles = [
+    ...tsData.clusters.flatMap(c => c.files).map(f => ({ ...f, language: 'typescript' })),
+    ...swiftData.clusters.flatMap(c => c.files).map(f => ({ ...f, language: 'swift' })),
+  ].filter(f => f.status !== 'deleted');
+
+  // Score each file: how many search terms match its searchTerms?
+  const scored = allFiles.map(f => {
+    const haystack = f.searchTerms || (f.label + ' ' + f.rel).toLowerCase();
+    const hits = terms.filter(t => haystack.includes(t));
+    return { file: f, score: hits.length, hits };
+  }).filter(s => s.score > 0);
+
+  // Sort by score descending
+  scored.sort((a, b) => b.score - a.score);
+
+  if (scored.length === 0) return { matches: [], strategy: 'no matches' };
+
+  // Adaptive threshold: take files that match at least half the top score,
+  // with a minimum of 2 terms matching to filter noise.
+  // Cap at 15 primary files to keep LLM context manageable.
+  const topScore = scored[0].score;
+  const threshold = Math.max(2, Math.ceil(topScore * 0.5));
+  let matches = scored
+    .filter(s => s.score >= threshold)
+    .slice(0, 15)
+    .map(s => s.file);
+
+  // If threshold 2 is too strict (0 results), fall back to 1
+  if (matches.length === 0) {
+    matches = scored.slice(0, 10).map(s => s.file);
   }
+
+  return {
+    matches,
+    strategy: `${terms.length} terms extracted, threshold ${threshold}/${topScore}, ${matches.length} files`,
+    extractedTerms: terms,
+  };
+}
+
+function traceFeature(description, tsData, swiftData) {
+  const terms = extractSearchTerms(description);
+
+  // Adaptive search: find files by scoring, not all-or-nothing
+  const { matches: matchingFiles, strategy, extractedTerms } = adaptiveSearch(terms, tsData, swiftData);
 
   // Collect the full set of file paths we'll read
   const matchRels = new Set(matchingFiles.map(f => f.rel));
@@ -2086,24 +2186,22 @@ function traceFeature(query, intent, tsData, swiftData) {
   }
 
   return {
-    query,
-    intent: intent || null,
+    description,
+    searchTerms: extractedTerms,
+    searchStrategy: strategy,
     matchCount: matchingFiles.length,
     neighborCount: neighborRels.size,
     entryPoints,
     files,
     dependencyGraph: {
       edges: subgraphEdges,
-      // Readable summary for LLM
       summary: subgraphEdges.map(e => {
         const fromLabel = files.find(f => f.path === e.from)?.label || e.from;
         const toLabel = files.find(f => f.path === e.to)?.label || e.to;
         return `${fromLabel} → ${toLabel}`;
       }),
     },
-    instructions: intent
-      ? `The user believes this feature works as follows:\n\n"${intent}"\n\nTrace the actual code paths through the provided files. For each step, cite the file and function. Flag any discrepancies between the user's description and what the code actually does. Look for: missing steps, extra steps, wrong ordering, stale code paths, and wrong assumptions.`
-      : `Trace how this feature works by reading the provided source files. Start from the entry points, follow the call chain, and describe each step with file/function references. Note any dead code, unused paths, or potential issues.`,
+    instructions: `The user provided this description of how they believe a feature works:\n\n"${description}"\n\nThe files below were identified as relevant by static analysis. Trace the actual code paths step by step. For each step, cite the file and line/function. Compare the actual behavior to the user's description. Flag:\n- Steps the user described that don't exist in the code\n- Steps in the code the user didn't mention\n- Steps that work differently than described\n- Wrong ordering or assumptions\n- Dead code, stale paths, or cleanup opportunities`,
   };
 }
 
@@ -2111,7 +2209,6 @@ function main() {
   const args = process.argv.slice(2);
   const searchArg = args.findIndex(a => a === '--search');
   const traceArg = args.findIndex(a => a === '--trace');
-  const intentArg = args.findIndex(a => a === '--intent');
   const jsonMode = args.includes('--json');
 
   console.error('🗺️  Analyzing codebase...');
@@ -2120,12 +2217,19 @@ function main() {
   console.error(`   Swift: ${swiftGraph.nodes.length} files, ${swiftGraph.edges.length} connections`);
   console.error(`   ${findings.length} findings`);
 
-  // --trace "query" [--intent "description"] → code context bundle for LLM
+  // --trace "natural language description of how the feature works"
+  // Single argument — the tool extracts search terms and uses the whole
+  // text as the intent description for the LLM to compare against.
   if (traceArg >= 0) {
-    const query = args[traceArg + 1];
-    if (!query) { console.error('Usage: --trace "query" [--intent "how it should work"]'); process.exit(1); }
-    const intent = intentArg >= 0 ? args[intentArg + 1] : null;
-    const result = traceFeature(query, intent, tsData, swiftData);
+    const description = args[traceArg + 1];
+    if (!description) {
+      console.error('Usage: --trace "describe how the feature is supposed to work"');
+      console.error('Example: --trace "The image pipeline fetches from Unsplash, scores with Gemini, picks the best one"');
+      process.exit(1);
+    }
+    const result = traceFeature(description, tsData, swiftData);
+    console.error(`   Search terms: ${result.searchTerms.join(', ')}`);
+    console.error(`   Strategy: ${result.searchStrategy}`);
     console.error(`   ${result.matchCount} primary files, ${result.neighborCount} neighbors`);
     console.error(`   Entry points: ${result.entryPoints.join(', ')}`);
     console.log(JSON.stringify(result, null, 2));

@@ -2095,11 +2095,48 @@ function adaptiveSearch(terms, tsData, swiftData) {
   };
 }
 
-function traceFeature(description, tsData, swiftData) {
-  const terms = extractSearchTerms(description);
+function isFilePath(str) {
+  return /\.(ts|tsx|swift|js|jsx)$/.test(str) || str.includes('/');
+}
 
-  // Adaptive search: find files by scoring, not all-or-nothing
-  const { matches: matchingFiles, strategy, extractedTerms } = adaptiveSearch(terms, tsData, swiftData);
+function findFileByPath(query, tsData, swiftData) {
+  const allFiles = [
+    ...tsData.clusters.flatMap(c => c.files).map(f => ({ ...f, language: 'typescript' })),
+    ...swiftData.clusters.flatMap(c => c.files).map(f => ({ ...f, language: 'swift' })),
+  ].filter(f => f.status !== 'deleted');
+
+  // Try exact rel match, then basename match, then substring match
+  const q = query.replace(/^\.\//, ''); // strip leading ./
+  let match = allFiles.find(f => f.rel === q);
+  if (!match) match = allFiles.find(f => f.rel.endsWith('/' + q));
+  if (!match) {
+    const base = path.basename(q);
+    match = allFiles.find(f => path.basename(f.rel) === base);
+  }
+  if (!match) match = allFiles.find(f => f.rel.includes(q));
+  return match || null;
+}
+
+function traceFeature(description, tsData, swiftData) {
+  let matchingFiles, strategy, extractedTerms;
+
+  // If the input looks like a file path, find that file directly
+  // and use it + its neighbors as the trace target
+  if (isFilePath(description)) {
+    const file = findFileByPath(description, tsData, swiftData);
+    if (file) {
+      matchingFiles = [file];
+      strategy = `direct file match: ${file.rel}`;
+      extractedTerms = [path.basename(file.rel)];
+    } else {
+      // File not found — fall through to NLP search
+      const terms = extractSearchTerms(description);
+      ({ matches: matchingFiles, strategy, extractedTerms } = adaptiveSearch(terms, tsData, swiftData));
+    }
+  } else {
+    const terms = extractSearchTerms(description);
+    ({ matches: matchingFiles, strategy, extractedTerms } = adaptiveSearch(terms, tsData, swiftData));
+  }
 
   // Collect the full set of file paths we'll read
   const matchRels = new Set(matchingFiles.map(f => f.rel));

@@ -2220,11 +2220,32 @@ The files below were identified as relevant by static analysis. Do the following
   };
 }
 
+function copyToClipboard(text) {
+  try {
+    execSync('pbcopy', { input: text, encoding: 'utf-8' });
+    return true;
+  } catch {
+    // pbcopy not available (Linux, CI, etc.) — try xclip/xsel
+    try {
+      execSync('xclip -selection clipboard', { input: text, encoding: 'utf-8' });
+      return true;
+    } catch {
+      try {
+        execSync('xsel --clipboard --input', { input: text, encoding: 'utf-8' });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+}
+
 function main() {
   const args = process.argv.slice(2);
   const searchArg = args.findIndex(a => a === '--search');
   const traceArg = args.findIndex(a => a === '--trace');
   const jsonMode = args.includes('--json');
+  const copyMode = args.includes('--copy');
 
   console.error('🗺️  Analyzing codebase...');
   const { tsGraph, swiftGraph, tsData, swiftData, findings } = analyze();
@@ -2233,8 +2254,7 @@ function main() {
   console.error(`   ${findings.length} findings`);
 
   // --trace "natural language description of how the feature works"
-  // Single argument — the tool extracts search terms and uses the whole
-  // text as the intent description for the LLM to compare against.
+  // --copy flag copies the JSON output to clipboard (no line-break issues)
   if (traceArg >= 0) {
     const description = args[traceArg + 1];
     if (!description) {
@@ -2247,7 +2267,17 @@ function main() {
     console.error(`   Strategy: ${result.searchStrategy}`);
     console.error(`   ${result.matchCount} primary files, ${result.neighborCount} neighbors`);
     console.error(`   Entry points: ${result.entryPoints.join(', ')}`);
-    console.log(JSON.stringify(result, null, 2));
+    const json = JSON.stringify(result, null, 2);
+    if (copyMode) {
+      if (copyToClipboard(json)) {
+        console.error('   📋 Copied to clipboard');
+      } else {
+        console.error('   ⚠ Clipboard not available — printing to stdout');
+        console.log(json);
+      }
+    } else {
+      console.log(json);
+    }
     return;
   }
 
@@ -2258,18 +2288,28 @@ function main() {
     const results = searchFiles(query, tsData, swiftData);
     const total = results.typescript.length + results.swift.length;
     console.error(`   ${total} matches for "${query}"`);
-    console.log(JSON.stringify(results, null, 2));
+    const json = JSON.stringify(results, null, 2);
+    if (copyMode) {
+      copyToClipboard(json) ? console.error('   📋 Copied to clipboard') : console.log(json);
+    } else {
+      console.log(json);
+    }
     return;
   }
 
   // --json → full analysis as JSON (for MCP tool)
   if (jsonMode) {
-    console.log(JSON.stringify({
+    const json = JSON.stringify({
       branch: getBranchName(),
       typescript: tsData,
       swift: swiftData,
       findings,
-    }, null, 2));
+    }, null, 2);
+    if (copyMode) {
+      copyToClipboard(json) ? console.error('   📋 Copied to clipboard') : console.log(json);
+    } else {
+      console.log(json);
+    }
     return;
   }
 
